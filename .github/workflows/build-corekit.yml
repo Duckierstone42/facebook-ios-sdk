@@ -68,7 +68,7 @@ jobs:
             -scheme FBSDKCoreKit-Dynamic \
             -destination 'generic/platform=iOS Simulator' \
             -configuration Release \
-            -derivedDataPath build \
+            -derivedDataPath build-dynamic \
             IPHONEOS_DEPLOYMENT_TARGET=12.0 \
             CODE_SIGNING_ALLOWED=NO \
             build 2>&1 | tail -80
@@ -81,7 +81,7 @@ jobs:
             -scheme FBSDKCoreKit-Static \
             -destination 'generic/platform=iOS Simulator' \
             -configuration Release \
-            -derivedDataPath build \
+            -derivedDataPath build-static \
             IPHONEOS_DEPLOYMENT_TARGET=12.0 \
             CODE_SIGNING_ALLOWED=NO \
             build 2>&1 | tail -80
@@ -92,11 +92,15 @@ jobs:
           ARTIFACT_DIR="build/artifacts"
           mkdir -p "$ARTIFACT_DIR"
 
-          echo "=== Build products tree ==="
-          find build/Build/Products -maxdepth 4 -print | head -120
+          echo "=== Dynamic build products ==="
+          find build-dynamic/Build/Products -maxdepth 4 -print || true
+
+          echo ""
+          echo "=== Static build products ==="
+          find build-static/Build/Products -maxdepth 4 -print || true
 
           # --- Dynamic framework binary ---
-          DYN_FW="build/Build/Products/Release-iphonesimulator/FBSDKCoreKit.framework"
+          DYN_FW="build-dynamic/Build/Products/Release-iphonesimulator/FBSDKCoreKit.framework"
           if [ -d "$DYN_FW" ]; then
             cp "$DYN_FW/FBSDKCoreKit" "$ARTIFACT_DIR/FBSDKCoreKit-dynamic"
             tar -czf "$ARTIFACT_DIR/FBSDKCoreKit-Dynamic.framework.tgz" \
@@ -105,22 +109,20 @@ jobs:
             file "$ARTIFACT_DIR/FBSDKCoreKit-dynamic"
           else
             echo "WARNING: Dynamic framework not found at $DYN_FW"
-            echo "Searching for it..."
-            find build -name "FBSDKCoreKit.framework" -type d 2>/dev/null || true
+            find build-dynamic -name "FBSDKCoreKit.framework" -type d 2>/dev/null || true
           fi
 
           # --- Static framework binary ---
-          STATIC_FW="build/Build/Products/Release-iphonesimulator/FBSDKCoreKit.framework"
-          STATIC_LIB=$(find build/Build/Products -name "libFBSDKCoreKit.a" 2>/dev/null | head -1)
-          if [ -n "$STATIC_LIB" ]; then
-            cp "$STATIC_LIB" "$ARTIFACT_DIR/FBSDKCoreKit-static.a"
-            echo "Static library:"
-            file "$ARTIFACT_DIR/FBSDKCoreKit-static.a"
+          STATIC_FW="build-static/Build/Products/Release-iphonesimulator/FBSDKCoreKit.framework"
+          if [ -d "$STATIC_FW" ]; then
+            cp "$STATIC_FW/FBSDKCoreKit" "$ARTIFACT_DIR/FBSDKCoreKit-static"
+            echo "Static framework Mach-O:"
+            file "$ARTIFACT_DIR/FBSDKCoreKit-static"
           fi
 
           # --- Dependency binaries (for full taint path analysis) ---
           for dep_fw in FBSDKCoreKit_Basics FBAEMKit; do
-            dep_path="build/Build/Products/Release-iphonesimulator/${dep_fw}.framework/${dep_fw}"
+            dep_path="build-dynamic/Build/Products/Release-iphonesimulator/${dep_fw}.framework/${dep_fw}"
             if [ -f "$dep_path" ]; then
               cp "$dep_path" "$ARTIFACT_DIR/${dep_fw}-dynamic"
               echo "${dep_fw} dynamic:"
@@ -138,6 +140,8 @@ jobs:
         run: |
           set +e
           BINARY="build/artifacts/FBSDKCoreKit-dynamic"
+          # Also check the dSYM for richer symbols
+          DSYM="build-dynamic/Build/Products/Release-iphonesimulator/FBSDKCoreKit.framework.dSYM"
           if [ ! -f "$BINARY" ]; then
             echo "Dynamic binary not found, skipping inspection"
             exit 0
