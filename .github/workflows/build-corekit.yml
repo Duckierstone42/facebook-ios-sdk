@@ -1,0 +1,181 @@
+name: Build FBSDKCoreKit Mach-O
+
+on:
+  push:
+    branches:
+      - main
+      - 'releases/**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-corekit:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve git symlinks
+        run: |
+          set -euo pipefail
+          # The repo stores xcconfig symlinks as text files on non-macOS clones.
+          # Re-create them as real symlinks so xcodebuild can follow the includes.
+          for link in \
+            FBAEMKit/Configurations/Shared \
+            FBSDKCoreKit/Configurations/Shared \
+            FBSDKCoreKit_Basics/Configurations/Shared \
+            FBSDKGamingServicesKit/Configurations/Shared \
+            FBSDKLoginKit/Configurations/Shared \
+            FBSDKShareKit/Configurations/Shared; do
+            if [ -f "$link" ] && [ ! -L "$link" ]; then
+              target=$(cat "$link")
+              rm "$link"
+              ln -s "$target" "$link"
+              echo "fixed symlink: $link -> $target"
+            else
+              echo "already a symlink or missing: $link"
+            fi
+          done
+
+      - name: Show toolchain
+        run: |
+          set -euxo pipefail
+          sw_vers
+          uname -a
+          xcode-select -p
+          xcodebuild -version
+          clang --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode projects
+        run: |
+          set -euo pipefail
+          for dir in FBSDKCoreKit_Basics FBAEMKit FBSDKCoreKit TestTools FBSDKLoginKit FBSDKShareKit FBSDKGamingServicesKit; do
+            echo "=== Generating $dir ==="
+            cd "$dir"
+            xcodegen generate
+            cd ..
+          done
+
+      - name: Build FBSDKCoreKit-Dynamic (iOS Simulator, Release)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace FacebookSDK.xcworkspace \
+            -scheme FBSDKCoreKit-Dynamic \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Release \
+            -derivedDataPath build \
+            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tail -80
+
+      - name: Build FBSDKCoreKit-Static (iOS Simulator, Release)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace FacebookSDK.xcworkspace \
+            -scheme FBSDKCoreKit-Static \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Release \
+            -derivedDataPath build \
+            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tail -80
+
+      - name: Prepare Mach-O artifacts
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="build/artifacts"
+          mkdir -p "$ARTIFACT_DIR"
+
+          echo "=== Build products tree ==="
+          find build/Build/Products -maxdepth 4 -print | head -120
+
+          # --- Dynamic framework binary ---
+          DYN_FW="build/Build/Products/Release-iphonesimulator/FBSDKCoreKit.framework"
+          if [ -d "$DYN_FW" ]; then
+            cp "$DYN_FW/FBSDKCoreKit" "$ARTIFACT_DIR/FBSDKCoreKit-dynamic"
+            tar -czf "$ARTIFACT_DIR/FBSDKCoreKit-Dynamic.framework.tgz" \
+              -C "$(dirname "$DYN_FW")" "$(basename "$DYN_FW")"
+            echo "Dynamic framework Mach-O:"
+            file "$ARTIFACT_DIR/FBSDKCoreKit-dynamic"
+          else
+            echo "WARNING: Dynamic framework not found at $DYN_FW"
+            echo "Searching for it..."
+            find build -name "FBSDKCoreKit.framework" -type d 2>/dev/null || true
+          fi
+
+          # --- Static framework binary ---
+          STATIC_FW="build/Build/Products/Release-iphonesimulator/FBSDKCoreKit.framework"
+          STATIC_LIB=$(find build/Build/Products -name "libFBSDKCoreKit.a" 2>/dev/null | head -1)
+          if [ -n "$STATIC_LIB" ]; then
+            cp "$STATIC_LIB" "$ARTIFACT_DIR/FBSDKCoreKit-static.a"
+            echo "Static library:"
+            file "$ARTIFACT_DIR/FBSDKCoreKit-static.a"
+          fi
+
+          # --- Dependency binaries (for full taint path analysis) ---
+          for dep_fw in FBSDKCoreKit_Basics FBAEMKit; do
+            dep_path="build/Build/Products/Release-iphonesimulator/${dep_fw}.framework/${dep_fw}"
+            if [ -f "$dep_path" ]; then
+              cp "$dep_path" "$ARTIFACT_DIR/${dep_fw}-dynamic"
+              echo "${dep_fw} dynamic:"
+              file "$ARTIFACT_DIR/${dep_fw}-dynamic"
+            fi
+          done
+
+          echo ""
+          echo "=== Final artifacts ==="
+          ls -la "$ARTIFACT_DIR"
+
+      - name: Inspect Mach-O (symbols and sections)
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          BINARY="build/artifacts/FBSDKCoreKit-dynamic"
+          if [ ! -f "$BINARY" ]; then
+            echo "Dynamic binary not found, skipping inspection"
+            exit 0
+          fi
+
+          echo "=== File type ==="
+          file "$BINARY"
+
+          echo ""
+          echo "=== Mach-O header ==="
+          otool -h "$BINARY"
+
+          echo ""
+          echo "=== Objective-C classes (privacy-relevant) ==="
+          nm "$BINARY" 2>/dev/null | grep -E 'FBSDKAppEvents|FBSDKDeviceInfo' | head -30
+
+          echo ""
+          echo "=== Privacy-sensitive API imports ==="
+          nm -u "$BINARY" 2>/dev/null | grep -iE 'UIDevice|ASIdentifier|CTTelephony|uname|sysctl|NSLocale|NSTimeZone|UIScreen' | head -20
+
+          echo ""
+          echo "=== Network sink imports ==="
+          nm -u "$BINARY" 2>/dev/null | grep -iE 'NSURLSession|NSURLConnection|dataTask' | head -10
+
+          echo ""
+          echo "=== Sections ==="
+          otool -l "$BINARY" 2>/dev/null | awk '/sectname/||/segname/' | paste - - | head -40
+
+          echo ""
+          echo "=== Objective-C selectors related to device info collection ==="
+          otool -ov "$BINARY" 2>/dev/null | grep -E 'systemVersion|advertisingIdentifier|carrierName|currentLocale|encodedDeviceInfo|_collectPersistentData|_generateEncoding|activityParametersDictionary' | head -30
+
+          exit 0
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FBSDKCoreKit-v16.1.3-iphonesimulator
+          path: build/artifacts
+          if-no-files-found: error
+          retention-days: 90
